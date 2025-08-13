@@ -12,6 +12,8 @@ import logging
 import fitz
 from PIL import Image
 import tempfile
+import concurrent.futures
+from typing import List, Dict, Any
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -39,105 +41,49 @@ class InvoiceProcessor:
                 event_data = event
             
             s3Bucket = event_data.get('s3_bucket')
-            s3Key = event_data.get('s3_key')
-            pdfData = event_data.get('pdf_data')
+            s3Key = event_data.get('s3_key')  # For single file processing
+            s3Folder = event_data.get('s3_folder')  # For bulk processing
+            pdfData = event_data.get('pdf_data')  # For direct upload
             customPrompt = event_data.get('prompt')
+            maxConcurrency = event_data.get('max_concurrency', 5)  # Limit concurrent processing
             
+            # Validate input parameters
             if not s3Bucket and not pdfData:
                 return {
                     'statusCode': 400,
                     'body': {
-                        'error': 'Either s3_bucket+s3_key or pdf_data is required',
+                        'error': 'Either s3_bucket+(s3_key or s3_folder) or pdf_data is required',
                         'usage': {
-                            's3_mode': 'Provide s3_bucket and s3_key',
+                            'single_file_mode': 'Provide s3_bucket and s3_key',
+                            'bulk_mode': 'Provide s3_bucket and s3_folder',
                             'direct_mode': 'Provide pdf_data as base64'
                         }
                     }
                 }
             
-            if s3Bucket and s3Key:
-                logger.info(f"Downloading PDF from S3: s3://{s3Bucket}/{s3Key}")
-                pdfData = self.downloadPdfFromS3(s3Bucket, s3Key)
-                if not pdfData:
-                    return {
-                        'statusCode': 400,
-                        'body': {
-                            'error': 'Failed to download PDF from S3',
-                            'details': 'Check if file exists and Lambda has S3 permissions'
-                        }
-                    }
+            if s3Bucket and s3Folder:
+                # Bulk processing mode
+                logger.info(f"Starting bulk processing for folder: s3://{s3Bucket}/{s3Folder}")
+                return self.processBulkInvoices(s3Bucket, s3Folder, customPrompt, maxConcurrency, context)
             
-            pdfData = self.cleanBase64Data(pdfData)
-            if not pdfData:
+            elif s3Bucket and s3Key:
+                # Single file processing mode (legacy support)
+                logger.info(f"Processing single file: s3://{s3Bucket}/{s3Key}")
+                return self.processSingleInvoice(s3Bucket, s3Key, None, customPrompt, context)
+            
+            elif pdfData:
+                # Direct PDF data processing
+                logger.info("Processing direct PDF data")
+                return self.processSingleInvoice(None, None, pdfData, customPrompt, context)
+            
+            else:
                 return {
                     'statusCode': 400,
                     'body': {
-                        'error': 'Invalid or corrupted PDF data',
-                        'details': 'PDF data must be valid base64 encoded'
+                        'error': 'Invalid parameters provided',
+                        'details': 'Must specify either s3_folder for bulk processing or s3_key for single file'
                     }
                 }
-            
-            try:
-                decodedPdf = base64.b64decode(pdfData)
-                if not decodedPdf.startswith(b'%PDF-'):
-                    return {
-                        'statusCode': 400,
-                        'body': {
-                            'error': 'File is not a valid PDF format',
-                            'detected_header': str(decodedPdf[:20]),
-                            'expected_header': '%PDF-'
-                        }
-                    }
-                logger.info(f"Valid PDF detected - Size: {len(decodedPdf)} bytes")
-            except Exception as e:
-                return {
-                    'statusCode': 400,
-                    'body': {
-                        'error': 'Cannot decode PDF data',
-                        'message': str(e)
-                    }
-                }
-            
-            logger.info("Processing PDF with enhanced extraction pipeline")
-            extractedData = self.enhancedProcessPdf(pdfData, decodedPdf, customPrompt)
-            
-            dataProcessor = DataProcessor()
-            excelProcessor = ExcelProcessor(self.s3Client)
-            dbProcessor = DatabaseProcessor()
-            
-            dataFrame = dataProcessor.createDataFrame(extractedData)
-            excelKey = excelProcessor.uploadToS3(dataFrame, s3Bucket)
-            dbProcessor.insertToPostgres(dataFrame)
-            
-            processingMetadata = {
-                'processed_at': datetime.now().isoformat(),
-                'request_id': context.aws_request_id,
-                'file_size_bytes': len(decodedPdf),
-                'source_location': f"s3://{s3Bucket}/{s3Key}" if s3Bucket and s3Key else "direct_upload",
-                'lambda_function': context.function_name,
-                'lambda_version': context.function_version,
-                'excel_location': f"s3://{s3Bucket}/{excelKey}"
-            }
-            
-            logger.info("Invoice extraction completed successfully")
-            logger.info(f"Extracted invoice: {extractedData.get('invoice_number', 'Unknown')} from {extractedData.get('vendor_name', 'Unknown vendor')}")
-            
-            return {
-                'statusCode': 200,
-                'body': {
-                    'success': True,
-                    'extracted_data': extractedData,
-                    'processing_metadata': processingMetadata,
-                    'summary': {
-                        'invoice_number': extractedData.get('invoice_number'),
-                        'vendor_name': extractedData.get('vendor_name'),
-                        'total_amount': extractedData.get('total_amount'),
-                        'currency': extractedData.get('currency'),
-                        'invoice_date': extractedData.get('invoice_date'),
-                        'extraction_confidence': self.calculateExtractionConfidence(extractedData)
-                    }
-                }
-            }
             
         except ClientError as e:
             errorCode = e.response['Error']['Code']
@@ -213,6 +159,318 @@ class InvoiceProcessor:
         
         logger.info(f"Base64 data validated successfully - Length: {len(data)}")
         return data
+
+    def processBulkInvoices(self, s3Bucket: str, s3Folder: str, customPrompt: str, maxConcurrency: int, context) -> Dict[str, Any]:
+        """Process multiple PDF invoices from an S3 folder"""
+        try:
+            logger.info(f"Starting bulk processing for folder: s3://{s3Bucket}/{s3Folder}")
+            
+            # Get list of PDF files in the folder
+            pdfFiles = self.listPdfFilesInFolder(s3Bucket, s3Folder)
+            
+            if not pdfFiles:
+                return {
+                    'statusCode': 400,
+                    'body': {
+                        'error': 'No PDF files found in the specified folder',
+                        'folder': f"s3://{s3Bucket}/{s3Folder}",
+                        'files_found': 0
+                    }
+                }
+            
+            logger.info(f"Found {len(pdfFiles)} PDF files to process")
+            
+            # Process files concurrently
+            allExtractionResults = []
+            processingErrors = []
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(maxConcurrency, len(pdfFiles))) as executor:
+                # Submit all processing jobs
+                future_to_file = {
+                    executor.submit(self.processSinglePdfFile, s3Bucket, pdfKey, customPrompt): pdfKey 
+                    for pdfKey in pdfFiles
+                }
+                
+                # Collect results as they complete
+                for future in concurrent.futures.as_completed(future_to_file):
+                    pdfKey = future_to_file[future]
+                    try:
+                        result = future.result()
+                        if result['success']:
+                            allExtractionResults.append(result['data'])
+                            logger.info(f"Successfully processed: {pdfKey}")
+                        else:
+                            processingErrors.append({
+                                'file': pdfKey,
+                                'error': result['error']
+                            })
+                            logger.error(f"Failed to process {pdfKey}: {result['error']}")
+                    except Exception as e:
+                        processingErrors.append({
+                            'file': pdfKey,
+                            'error': f"Processing exception: {str(e)}"
+                        })
+                        logger.error(f"Exception processing {pdfKey}: {e}")
+            
+            if not allExtractionResults:
+                return {
+                    'statusCode': 500,
+                    'body': {
+                        'error': 'All files failed to process',
+                        'total_files': len(pdfFiles),
+                        'errors': processingErrors
+                    }
+                }
+            
+            # Create bulk Excel and database entries
+            bulkProcessor = BulkDataProcessor()
+            dataFrame = bulkProcessor.createBulkDataFrame(allExtractionResults)
+            
+            excelProcessor = ExcelProcessor(self.s3Client)
+            dbProcessor = DatabaseProcessor()
+            
+            # Generate bulk Excel file
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            bulkExcelKey = f"bulk-processed/{timestamp}_bulk_invoices_{len(allExtractionResults)}_files.xlsx"
+            excelProcessor.uploadBulkToS3(dataFrame, s3Bucket, bulkExcelKey)
+            
+            # Insert all records to database
+            dbProcessor.insertBulkToPostgres(dataFrame)
+            
+            # Prepare summary
+            processingMetadata = {
+                'processed_at': datetime.now().isoformat(),
+                'request_id': context.aws_request_id,
+                'total_files_found': len(pdfFiles),
+                'files_processed_successfully': len(allExtractionResults),
+                'files_failed': len(processingErrors),
+                'source_folder': f"s3://{s3Bucket}/{s3Folder}",
+                'lambda_function': context.function_name,
+                'lambda_version': context.function_version,
+                'bulk_excel_location': f"s3://{s3Bucket}/{bulkExcelKey}"
+            }
+            
+            # Calculate summary statistics
+            totalAmount = sum(item.get('total_amount', 0) for item in allExtractionResults if item.get('total_amount'))
+            avgConfidence = sum(self.calculateExtractionConfidence(item) for item in allExtractionResults) / len(allExtractionResults)
+            
+            logger.info(f"Bulk processing completed: {len(allExtractionResults)} files processed successfully")
+            
+            return {
+                'statusCode': 200,
+                'body': {
+                    'success': True,
+                    'processing_metadata': processingMetadata,
+                    'summary': {
+                        'total_files_processed': len(allExtractionResults),
+                        'total_amount_sum': round(totalAmount, 2),
+                        'average_confidence': round(avgConfidence, 2),
+                        'processing_errors': len(processingErrors)
+                    },
+                    'processed_files': [
+                        {
+                            'file': item.get('source_file', 'unknown'),
+                            'invoice_number': item.get('invoice_number'),
+                            'vendor_name': item.get('vendor_name'),
+                            'total_amount': item.get('total_amount'),
+                            'confidence': self.calculateExtractionConfidence(item)
+                        } for item in allExtractionResults
+                    ],
+                    'errors': processingErrors if processingErrors else None
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Bulk processing failed: {e}")
+            return {
+                'statusCode': 500,
+                'body': {
+                    'error': 'Bulk processing failed',
+                    'message': str(e),
+                    'request_id': context.aws_request_id
+                }
+            }
+
+    def listPdfFilesInFolder(self, s3Bucket: str, s3Folder: str) -> List[str]:
+        """List all PDF files in an S3 folder"""
+        try:
+            # Ensure folder path ends with /
+            if s3Folder and not s3Folder.endswith('/'):
+                s3Folder += '/'
+            
+            paginator = self.s3Client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(Bucket=s3Bucket, Prefix=s3Folder)
+            
+            pdfFiles = []
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        key = obj['Key']
+                        if key.lower().endswith('.pdf') and not key.endswith('/'):
+                            pdfFiles.append(key)
+            
+            logger.info(f"Found {len(pdfFiles)} PDF files in s3://{s3Bucket}/{s3Folder}")
+            return pdfFiles
+            
+        except Exception as e:
+            logger.error(f"Error listing files in folder: {e}")
+            return []
+
+    def processSinglePdfFile(self, s3Bucket: str, s3Key: str, customPrompt: str) -> Dict[str, Any]:
+        """Process a single PDF file and return results"""
+        try:
+            logger.info(f"Processing individual file: {s3Key}")
+            
+            # Download PDF from S3
+            pdfData = self.downloadPdfFromS3(s3Bucket, s3Key)
+            if not pdfData:
+                return {
+                    'success': False,
+                    'error': f'Failed to download PDF: {s3Key}'
+                }
+            
+            # Clean and validate PDF data
+            pdfData = self.cleanBase64Data(pdfData)
+            if not pdfData:
+                return {
+                    'success': False,
+                    'error': f'Invalid PDF data: {s3Key}'
+                }
+            
+            try:
+                decodedPdf = base64.b64decode(pdfData)
+                if not decodedPdf.startswith(b'%PDF-'):
+                    return {
+                        'success': False,
+                        'error': f'Invalid PDF format: {s3Key}'
+                    }
+            except Exception as e:
+                return {
+                    'success': False,
+                    'error': f'Cannot decode PDF: {s3Key} - {str(e)}'
+                }
+            
+            # Process PDF with enhanced pipeline
+            extractedData = self.enhancedProcessPdf(pdfData, decodedPdf, customPrompt)
+            
+            # Add source file information
+            extractedData['source_file'] = s3Key
+            extractedData['file_size_bytes'] = len(decodedPdf)
+            
+            return {
+                'success': True,
+                'data': extractedData
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing {s3Key}: {e}")
+            return {
+                'success': False,
+                'error': f'Processing error: {s3Key} - {str(e)}'
+            }
+
+    def processSingleInvoice(self, s3Bucket: str, s3Key: str, pdfData: str, customPrompt: str, context) -> Dict[str, Any]:
+        """Process a single invoice (legacy method for backward compatibility)"""
+        try:
+            if pdfData:
+                # Direct PDF data provided
+                decodedPdf = base64.b64decode(pdfData)
+                sourceLocation = "direct_upload"
+            else:
+                # Download from S3
+                pdfData = self.downloadPdfFromS3(s3Bucket, s3Key)
+                if not pdfData:
+                    return {
+                        'statusCode': 400,
+                        'body': {
+                            'error': 'Failed to download PDF from S3',
+                            'details': 'Check if file exists and Lambda has S3 permissions'
+                        }
+                    }
+                
+                pdfData = self.cleanBase64Data(pdfData)
+                if not pdfData:
+                    return {
+                        'statusCode': 400,
+                        'body': {
+                            'error': 'Invalid or corrupted PDF data',
+                            'details': 'PDF data must be valid base64 encoded'
+                        }
+                    }
+                
+                try:
+                    decodedPdf = base64.b64decode(pdfData)
+                    if not decodedPdf.startswith(b'%PDF-'):
+                        return {
+                            'statusCode': 400,
+                            'body': {
+                                'error': 'File is not a valid PDF format',
+                                'detected_header': str(decodedPdf[:20]),
+                                'expected_header': '%PDF-'
+                            }
+                        }
+                except Exception as e:
+                    return {
+                        'statusCode': 400,
+                        'body': {
+                            'error': 'Cannot decode PDF data',
+                            'message': str(e)
+                        }
+                    }
+                
+                sourceLocation = f"s3://{s3Bucket}/{s3Key}"
+            
+            logger.info("Processing PDF with enhanced extraction pipeline")
+            extractedData = self.enhancedProcessPdf(pdfData, decodedPdf, customPrompt)
+            
+            dataProcessor = DataProcessor()
+            excelProcessor = ExcelProcessor(self.s3Client)
+            dbProcessor = DatabaseProcessor()
+            
+            dataFrame = dataProcessor.createDataFrame(extractedData)
+            excelKey = excelProcessor.uploadToS3(dataFrame, s3Bucket or "default-bucket")
+            dbProcessor.insertToPostgres(dataFrame)
+            
+            processingMetadata = {
+                'processed_at': datetime.now().isoformat(),
+                'request_id': context.aws_request_id,
+                'file_size_bytes': len(decodedPdf),
+                'source_location': sourceLocation,
+                'lambda_function': context.function_name,
+                'lambda_version': context.function_version,
+                'excel_location': f"s3://{s3Bucket or 'default-bucket'}/{excelKey}"
+            }
+            
+            logger.info("Invoice extraction completed successfully")
+            logger.info(f"Extracted invoice: {extractedData.get('invoice_number', 'Unknown')} from {extractedData.get('vendor_name', 'Unknown vendor')}")
+            
+            return {
+                'statusCode': 200,
+                'body': {
+                    'success': True,
+                    'extracted_data': extractedData,
+                    'processing_metadata': processingMetadata,
+                    'summary': {
+                        'invoice_number': extractedData.get('invoice_number'),
+                        'vendor_name': extractedData.get('vendor_name'),
+                        'total_amount': extractedData.get('total_amount'),
+                        'currency': extractedData.get('currency'),
+                        'invoice_date': extractedData.get('invoice_date'),
+                        'extraction_confidence': self.calculateExtractionConfidence(extractedData)
+                    }
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Single invoice processing failed: {e}")
+            return {
+                'statusCode': 500,
+                'body': {
+                    'error': 'Invoice processing failed',
+                    'message': str(e),
+                    'request_id': context.aws_request_id
+                }
+            }
 
     def enhancedProcessPdf(self, pdfData, decodedPdf, customPrompt=None):
         try:
@@ -1178,6 +1436,103 @@ class DataProcessor:
         return pd.DataFrame([bulkPaymentData])
 
 
+class BulkDataProcessor:
+    def createBulkDataFrame(self, extractedDataList: List[Dict[str, Any]]) -> pd.DataFrame:
+        """Create a DataFrame from multiple extracted invoice data"""
+        bulkData = []
+        
+        for extractedData in extractedDataList:
+            vendorInfo = extractedData.get('vendor', {}) if isinstance(extractedData.get('vendor'), dict) else {}
+            bankDetails = extractedData.get('bank_details', {}) if isinstance(extractedData.get('bank_details'), dict) else {}
+            totals = extractedData.get('totals', {}) if isinstance(extractedData.get('totals'), dict) else {}
+            additionalInfo = extractedData.get('additional_info', {}) if isinstance(extractedData.get('additional_info'), dict) else {}
+            
+            # Extract vendor name from multiple possible locations
+            vendorName = (
+                vendorInfo.get('name') or 
+                extractedData.get('vendor_name') or 
+                extractedData.get('vendor', {}).get('name') if isinstance(extractedData.get('vendor'), dict) else extractedData.get('vendor') or
+                None
+            )
+            
+            # Extract total amount from multiple possible locations  
+            totalAmount = (
+                totals.get('total_amount') or 
+                extractedData.get('total_amount') or 
+                0
+            )
+            
+            # Extract currency
+            currency = (
+                additionalInfo.get('currency') or 
+                extractedData.get('currency') or 
+                'USD'
+            )
+            
+            # Extract vendor address
+            vendorAddress = (
+                vendorInfo.get('address') or 
+                extractedData.get('vendor_address') or 
+                None
+            )
+            
+            # Extract dates
+            invoiceDate = extractedData.get('invoice_date')
+            dueDate = extractedData.get('due_date') or extractedData.get('payment_terms', {}).get('due_date') if isinstance(extractedData.get('payment_terms'), dict) else None
+            
+            bulkPaymentData = {
+                'vendorName': vendorName,
+                'accountNumber': bankDetails.get('account_number') or None,
+                'routingNumber': bankDetails.get('routing_number') or bankDetails.get('swift_code') or None,
+                'paymentAmount': totalAmount,
+                'invoiceNumber': extractedData.get('invoice_number') or None,
+                'invoiceDate': invoiceDate if invoiceDate and invoiceDate.strip() and invoiceDate != 'null' else None,
+                'dueDate': dueDate if dueDate and str(dueDate).strip() and dueDate != 'null' else None,
+                'currency': currency,
+                'paymentReference': f"INV-{extractedData.get('invoice_number', 'UNKNOWN')}",
+                'bankName': bankDetails.get('bank_name') or None,
+                'swiftCode': bankDetails.get('swift_code') or None,
+                'vendorAddress': vendorAddress,
+                'sourceFile': extractedData.get('source_file', 'unknown'),
+                'fileSizeBytes': extractedData.get('file_size_bytes', 0),
+                'extractionConfidence': self.calculateExtractionConfidence(extractedData),
+                'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            bulkData.append(bulkPaymentData)
+        
+        logger.info(f"Created bulk DataFrame with {len(bulkData)} records")
+        return pd.DataFrame(bulkData)
+    
+    def calculateExtractionConfidence(self, extractedData):
+        """Calculate confidence score for individual invoice"""
+        if not extractedData:
+            return 0.0
+        
+        criticalFields = ['invoice_number', 'vendor_name', 'total_amount', 'invoice_date']
+        importantFields = ['due_date', 'currency', 'vendor_address']
+        
+        # Check for nested vendor name
+        vendorName = extractedData.get('vendor_name') or extractedData.get('vendor', {}).get('name') if isinstance(extractedData.get('vendor'), dict) else extractedData.get('vendor')
+        totalAmount = extractedData.get('total_amount') or extractedData.get('totals', {}).get('total_amount') if isinstance(extractedData.get('totals'), dict) else None
+        
+        criticalScore = 0
+        if extractedData.get('invoice_number'): criticalScore += 1
+        if vendorName: criticalScore += 1  
+        if totalAmount: criticalScore += 1
+        if extractedData.get('invoice_date'): criticalScore += 1
+        criticalScore = criticalScore / len(criticalFields)
+        
+        importantScore = 0
+        if extractedData.get('due_date'): importantScore += 1
+        if extractedData.get('currency'): importantScore += 1
+        if extractedData.get('vendor_address') or extractedData.get('vendor', {}).get('address') if isinstance(extractedData.get('vendor'), dict) else None: importantScore += 1
+        importantScore = importantScore / len(importantFields)
+        
+        confidence = (criticalScore * 0.7) + (importantScore * 0.3)
+        return round(confidence, 2)
+
+
 class ExcelProcessor:
     def __init__(self, s3Client):
         self.s3Client = s3Client
@@ -1201,6 +1556,62 @@ class ExcelProcessor:
         )
         
         logger.info(f"Excel file uploaded to s3://{bucketName}/{excelKey}")
+        return excelKey
+    
+    def uploadBulkToS3(self, dataFrame, bucketName, excelKey):
+        """Upload bulk Excel file with all invoices"""
+        excelBuffer = BytesIO()
+        
+        with pd.ExcelWriter(excelBuffer, engine='openpyxl') as writer:
+            # Main sheet with all bulk payment data
+            dataFrame.to_excel(writer, sheet_name='BulkPayments', index=False)
+            
+            # Summary sheet with statistics
+            summaryData = {
+                'Metric': [
+                    'Total Files Processed',
+                    'Total Payment Amount',
+                    'Average Confidence Score',
+                    'Unique Vendors',
+                    'Processing Date',
+                    'Currency Mix'
+                ],
+                'Value': [
+                    len(dataFrame),
+                    f"{dataFrame['paymentAmount'].sum():,.2f}",
+                    f"{dataFrame['extractionConfidence'].mean():.2%}",
+                    dataFrame['vendorName'].nunique(),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    ', '.join(dataFrame['currency'].value_counts().head(3).index.tolist())
+                ]
+            }
+            summaryDf = pd.DataFrame(summaryData)
+            summaryDf.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Vendor breakdown sheet
+            vendorSummary = dataFrame.groupby('vendorName').agg({
+                'paymentAmount': ['sum', 'count'],
+                'extractionConfidence': 'mean'
+            }).round(2)
+            vendorSummary.columns = ['Total_Amount', 'Invoice_Count', 'Avg_Confidence']
+            vendorSummary = vendorSummary.reset_index()
+            vendorSummary.to_excel(writer, sheet_name='VendorSummary', index=False)
+        
+        excelBuffer.seek(0)
+        
+        self.s3Client.put_object(
+            Bucket=bucketName,
+            Key=excelKey,
+            Body=excelBuffer.getvalue(),
+            ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            Metadata={
+                'total-invoices': str(len(dataFrame)),
+                'processing-date': datetime.now().isoformat(),
+                'file-type': 'bulk-invoice-processing'
+            }
+        )
+        
+        logger.info(f"Bulk Excel file uploaded to s3://{bucketName}/{excelKey} with {len(dataFrame)} records")
         return excelKey
 
 
@@ -1261,6 +1672,79 @@ class DatabaseProcessor:
             
         except Exception as e:
             logger.error(f"Database error: {e}")
+            raise
+        finally:
+            if connection:
+                cursor.close()
+                connection.close()
+    
+    def insertBulkToPostgres(self, bulkDataFrame):
+        try:
+            connection = psycopg2.connect(**self.dbConfig)
+            cursor = connection.cursor()
+            
+            createTableQuery = """
+            CREATE TABLE IF NOT EXISTS bulk_payments (
+                id SERIAL PRIMARY KEY,
+                vendor_name VARCHAR(255),
+                account_number VARCHAR(50),
+                routing_number VARCHAR(20),
+                payment_amount DECIMAL(12,2),
+                invoice_number VARCHAR(100),
+                invoice_date DATE,
+                due_date DATE,
+                currency VARCHAR(10),
+                payment_reference VARCHAR(100),
+                bank_name VARCHAR(255),
+                swift_code VARCHAR(20),
+                vendor_address TEXT,
+                processed_date TIMESTAMP,
+                batch_id VARCHAR(100),
+                confidence_score DECIMAL(5,2),
+                extraction_method VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+            cursor.execute(createTableQuery)
+            
+            batchId = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            insertedCount = 0
+            
+            for _, row in bulkDataFrame.iterrows():
+                try:
+                    insertQuery = """
+                    INSERT INTO bulk_payments (
+                        vendor_name, account_number, routing_number, payment_amount,
+                        invoice_number, invoice_date, due_date, currency,
+                        payment_reference, bank_name, swift_code, vendor_address, 
+                        processed_date, batch_id, confidence_score, extraction_method
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(insertQuery, (
+                        row.get('vendorName'), row.get('accountNumber'), row.get('routingNumber'),
+                        row.get('paymentAmount'), row.get('invoiceNumber'), row.get('invoiceDate'),
+                        row.get('dueDate'), row.get('currency'), row.get('paymentReference'),
+                        row.get('bankName'), row.get('swiftCode'), row.get('vendorAddress'),
+                        row.get('processedDate'), batchId, row.get('confidenceScore'), 
+                        row.get('extractionMethod', 'AI')
+                    ))
+                    insertedCount += 1
+                except Exception as rowError:
+                    logger.error(f"Failed to insert row for invoice {row.get('invoiceNumber', 'unknown')}: {rowError}")
+                    continue
+            
+            connection.commit()
+            logger.info(f"Successfully inserted {insertedCount}/{len(bulkDataFrame)} records into PostgreSQL with batch_id: {batchId}")
+            
+            return {
+                'inserted_count': insertedCount,
+                'total_records': len(bulkDataFrame),
+                'batch_id': batchId,
+                'success_rate': round((insertedCount / len(bulkDataFrame)) * 100, 2) if len(bulkDataFrame) > 0 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"Bulk database error: {e}")
             raise
         finally:
             if connection:
