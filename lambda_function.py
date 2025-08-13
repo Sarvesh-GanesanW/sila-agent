@@ -1392,27 +1392,27 @@ class DataProcessor:
         
         # Clean all values and only include populated fields
         rawData = {
-            'vendorName': self.cleanValue(vendorName),
-            'accountNumber': self.cleanValue(bankDetails.get('account_number')),
-            'routingNumber': self.cleanValue(bankDetails.get('routing_number')),
-            'paymentAmount': totalAmount if totalAmount and totalAmount > 0 else None,
-            'invoiceNumber': self.cleanValue(extractedData.get('invoice_number')),
-            'invoiceDate': self.cleanValue(invoiceDate),
-            'dueDate': self.cleanValue(dueDate),
+            'vendor_name': self.cleanValue(vendorName),
+            'account_number': self.cleanValue(bankDetails.get('account_number')),
+            'routing_number': self.cleanValue(bankDetails.get('routing_number')),
+            'payment_amount': totalAmount if totalAmount and totalAmount > 0 else None,
+            'invoice_number': self.cleanValue(extractedData.get('invoice_number')),
+            'invoice_date': self.cleanValue(invoiceDate),
+            'due_date': self.cleanValue(dueDate),
             'currency': self.cleanValue(currency) or 'USD',
-            'paymentReference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
-            'bankName': self.cleanValue(bankDetails.get('bank_name')),
-            'ifscCode': self.cleanValue(bankDetails.get('ifsc_code')),
-            'vendorAddress': self.cleanValue(vendorAddress),
-            'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            'payment_reference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
+            'bank_name': self.cleanValue(bankDetails.get('bank_name')),
+            'ifsc_code': self.cleanValue(bankDetails.get('ifsc_code')),
+            'vendor_address': self.cleanValue(vendorAddress),
+            'processed_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
         # Ensure critical fields always exist, even if empty
         bulkPaymentData = {}
         for k, v in rawData.items():
-            if k in ['vendorName', 'paymentAmount', 'currency', 'processedDate']:
+            if k in ['vendor_name', 'payment_amount', 'currency', 'processed_date']:
                 # Critical fields must always be present
-                bulkPaymentData[k] = v if v is not None else ('Unknown' if k == 'vendorName' else 'USD' if k == 'currency' else v)
+                bulkPaymentData[k] = v if v is not None else ('Unknown' if k == 'vendor_name' else 'USD' if k == 'currency' else v)
             elif v is not None:
                 # Optional fields only if they have values
                 bulkPaymentData[k] = v
@@ -1477,29 +1477,29 @@ class BulkDataProcessor:
             
             # Clean all values and only include populated fields
             rawData = {
-                'vendorName': self.cleanValue(vendorName),
-                'accountNumber': self.cleanValue(bankDetails.get('account_number')),
-                'routingNumber': self.cleanValue(bankDetails.get('routing_number') or bankDetails.get('ifsc_code')),
-                'paymentAmount': totalAmount if totalAmount and totalAmount > 0 else None,
-                'invoiceNumber': self.cleanValue(extractedData.get('invoice_number')),
-                'invoiceDate': self.cleanValue(invoiceDate),
-                'dueDate': self.cleanValue(dueDate),
+                'vendor_name': self.cleanValue(vendorName),
+                'account_number': self.cleanValue(bankDetails.get('account_number')),
+                'routing_number': self.cleanValue(bankDetails.get('routing_number') or bankDetails.get('ifsc_code')),
+                'payment_amount': totalAmount if totalAmount and totalAmount > 0 else None,
+                'invoice_number': self.cleanValue(extractedData.get('invoice_number')),
+                'invoice_date': self.cleanValue(invoiceDate),
+                'due_date': self.cleanValue(dueDate),
                 'currency': self.cleanValue(currency) or 'USD',
-                'paymentReference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
-                'bankName': self.cleanValue(bankDetails.get('bank_name')),
-                'ifscCode': self.cleanValue(bankDetails.get('ifsc_code')),
-                'vendorAddress': self.cleanValue(vendorAddress),
-                'sourceFile': self.cleanValue(extractedData.get('source_file')) or 'unknown',
-                'extractionConfidence': self.calculateExtractionConfidence(extractedData),
-                'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                'payment_reference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
+                'bank_name': self.cleanValue(bankDetails.get('bank_name')),
+                'ifsc_code': self.cleanValue(bankDetails.get('ifsc_code')),
+                'vendor_address': self.cleanValue(vendorAddress),
+                'source_file': self.cleanValue(extractedData.get('source_file')) or 'unknown',
+                'extraction_confidence': self.calculateExtractionConfidence(extractedData),
+                'processed_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             
             # Ensure critical fields always exist
             cleanedData = {}
             for k, v in rawData.items():
-                if k in ['vendorName', 'paymentAmount', 'currency', 'processedDate']:
+                if k in ['vendor_name', 'payment_amount', 'currency', 'processed_date']:
                     # Critical fields must always be present
-                    cleanedData[k] = v if v is not None else ('Unknown' if k == 'vendorName' else 0.0 if k == 'paymentAmount' else 'USD' if k == 'currency' else v)
+                    cleanedData[k] = v if v is not None else ('Unknown' if k == 'vendor_name' else 0.0 if k == 'payment_amount' else 'USD' if k == 'currency' else v)
                 elif v is not None:
                     # Optional fields only if they have values
                     cleanedData[k] = v
@@ -1550,7 +1550,7 @@ class ExcelProcessor:
         excelBuffer.seek(0)
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        invoiceNumber = dataFrame.iloc[0]['invoiceNumber'] if not dataFrame.empty else 'UNKNOWN'
+        invoiceNumber = dataFrame.iloc[0]['invoice_number'] if not dataFrame.empty else 'UNKNOWN'
         excelKey = f"processed-invoices/{timestamp}_{invoiceNumber}_bulk_payment.xlsx"
         
         self.s3Client.put_object(
@@ -1583,9 +1583,9 @@ class ExcelProcessor:
                 ],
                 'Value': [
                     len(dataFrame),
-                    f"{dataFrame['paymentAmount'].sum():,.2f}",
-                    f"{dataFrame['extractionConfidence'].mean():.2%}",
-                    dataFrame['vendorName'].nunique(),
+                    f"{dataFrame['payment_amount'].sum():,.2f}",
+                    f"{dataFrame['extraction_confidence'].mean():.2%}",
+                    dataFrame['vendor_name'].nunique(),
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                     ', '.join(dataFrame['currency'].value_counts().head(3).index.tolist())
                 ]
@@ -1594,9 +1594,9 @@ class ExcelProcessor:
             summaryDf.to_excel(writer, sheet_name='Summary', index=False)
             
             # Vendor breakdown sheet
-            vendorSummary = dataFrame.groupby('vendorName').agg({
-                'paymentAmount': ['sum', 'count'],
-                'extractionConfidence': 'mean'
+            vendorSummary = dataFrame.groupby('vendor_name').agg({
+                'payment_amount': ['sum', 'count'],
+                'extraction_confidence': 'mean'
             }).round(2)
             vendorSummary.columns = ['Total_Amount', 'Invoice_Count', 'Avg_Confidence']
             vendorSummary = vendorSummary.reset_index()
@@ -1665,11 +1665,11 @@ class DatabaseProcessor:
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 cursor.execute(insertQuery, (
-                    row['vendorName'], row['accountNumber'], row['routingNumber'],
-                    row['paymentAmount'], row['invoiceNumber'], row['invoiceDate'],
-                    row['dueDate'], row['currency'], row['paymentReference'],
-                    row['bankName'], row['swiftCode'], row['vendorAddress'],
-                    row['processedDate']
+                    row['vendor_name'], row['account_number'], row['routing_number'],
+                    row['payment_amount'], row['invoice_number'], row['invoice_date'],
+                    row['due_date'], row['currency'], row['payment_reference'],
+                    row['bank_name'], row['ifsc_code'], row['vendor_address'],
+                    row['processed_date']
                 ))
             
             connection.commit()
@@ -1726,16 +1726,16 @@ class DatabaseProcessor:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
                     cursor.execute(insertQuery, (
-                        row.get('vendorName'), row.get('accountNumber'), row.get('routingNumber'),
-                        row.get('paymentAmount'), row.get('invoiceNumber'), row.get('invoiceDate'),
-                        row.get('dueDate'), row.get('currency'), row.get('paymentReference'),
-                        row.get('bankName'), row.get('swiftCode'), row.get('vendorAddress'),
-                        row.get('processedDate'), batchId, row.get('confidenceScore'), 
-                        row.get('extractionMethod', 'AI')
+                        row.get('vendor_name'), row.get('account_number'), row.get('routing_number'),
+                        row.get('payment_amount'), row.get('invoice_number'), row.get('invoice_date'),
+                        row.get('due_date'), row.get('currency'), row.get('payment_reference'),
+                        row.get('bank_name'), row.get('ifsc_code'), row.get('vendor_address'),
+                        row.get('processed_date'), batchId, row.get('extraction_confidence'), 
+                        row.get('extraction_method', 'AI')
                     ))
                     insertedCount += 1
                 except Exception as rowError:
-                    logger.error(f"Failed to insert row for invoice {row.get('invoiceNumber', 'unknown')}: {rowError}")
+                    logger.error(f"Failed to insert row for invoice {row.get('invoice_number', 'unknown')}: {rowError}")
                     continue
             
             connection.commit()
