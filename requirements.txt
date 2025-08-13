@@ -1,4 +1,6 @@
-pandas
+Dpandas
 boto3
 psycopg2-binary
 openpyxl
+PyMuPDF
+Pillow

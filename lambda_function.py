@@ -1123,19 +1123,22 @@ Double-check your extraction for accuracy before responding. Begin extraction:""
 
 class DataProcessor:
     def createDataFrame(self, extractedData):
+        invoiceDate = extractedData.get('invoice_date')
+        dueDate = extractedData.get('due_date')
+        
         bulkPaymentData = {
-            'vendorName': extractedData.get('vendor_name', ''),
-            'accountNumber': extractedData.get('bank_details', {}).get('account_number', ''),
-            'routingNumber': extractedData.get('bank_details', {}).get('routing_number', ''),
-            'paymentAmount': extractedData.get('total_amount', 0),
-            'invoiceNumber': extractedData.get('invoice_number', ''),
-            'invoiceDate': extractedData.get('invoice_date', ''),
-            'dueDate': extractedData.get('due_date', ''),
+            'vendorName': extractedData.get('vendor_name') or None,
+            'accountNumber': extractedData.get('bank_details', {}).get('account_number') or None,
+            'routingNumber': extractedData.get('bank_details', {}).get('routing_number') or None,
+            'paymentAmount': extractedData.get('total_amount') or 0,
+            'invoiceNumber': extractedData.get('invoice_number') or None,
+            'invoiceDate': invoiceDate if invoiceDate and invoiceDate.strip() and invoiceDate != 'null' else None,
+            'dueDate': dueDate if dueDate and dueDate.strip() and dueDate != 'null' else None,
             'currency': extractedData.get('currency', 'USD'),
             'paymentReference': f"INV-{extractedData.get('invoice_number', 'UNKNOWN')}",
-            'bankName': extractedData.get('bank_details', {}).get('bank_name', ''),
-            'swiftCode': extractedData.get('bank_details', {}).get('swift_code', ''),
-            'vendorAddress': extractedData.get('vendor_address', ''),
+            'bankName': extractedData.get('bank_details', {}).get('bank_name') or None,
+            'swiftCode': extractedData.get('bank_details', {}).get('swift_code') or None,
+            'vendorAddress': extractedData.get('vendor_address') or None,
             'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
