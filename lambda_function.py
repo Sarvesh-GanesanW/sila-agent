@@ -324,6 +324,7 @@ class InvoiceProcessor:
             # Download PDF from S3
             pdfData = self.downloadPdfFromS3(s3Bucket, s3Key)
             if not pdfData:
+                logger.error(f"Failed to download PDF: {s3Key}")
                 return {
                     'success': False,
                     'error': f'Failed to download PDF: {s3Key}'
@@ -1318,80 +1319,52 @@ Look more carefully for:
         return suggestions.get(errorCode, 'Check AWS documentation for this error code')
 
     def getComprehensiveExtractionPrompt(self):
-        return """You are an expert invoice data extraction system. Analyze this invoice document thoroughly and extract ALL relevant information with maximum accuracy.
+        return """You are an expert invoice data extraction system. Extract ONLY the essential payment information from this invoice.
 
-Return the data as a JSON object with this exact structure. Extract precisely what you see - do not infer, assume, or modify anything:
+MANDATORY: Find the vendor/supplier name - look at the top of the invoice, letterhead, or "From" section.
+
+Return ONLY this simplified JSON structure with populated values:
 
 {
-    "invoice_number": "exact invoice/reference number as shown",
-    "invoice_date": "date in YYYY-MM-DD format",
-    "due_date": "due date in YYYY-MM-DD format if shown",
-    "vendor_name": "full vendor/supplier company name",
-    "vendor_address": "complete vendor address as shown",
-    "vendor_email": "vendor email if present",
-    "vendor_phone": "vendor phone if present",
-    "vendor_tax_id": "tax ID/VAT number if present",
-    "vendor_website": "website if present",
-    "bill_to_name": "billing company/person name",
-    "bill_to_address": "complete billing address",
-    "ship_to_name": "shipping company/person name if different",
-    "ship_to_address": "shipping address if present",
-    "purchase_order": "PO number if referenced",
-    "total_amount": "final total amount as number",
-    "subtotal": "subtotal before tax as number",
-    "tax_amount": "total tax amount as number",
-    "currency": "currency code or symbol as shown",
-    "payment_terms": "payment terms description",
-    "payment_method": "accepted payment methods if listed",
+    "invoice_number": "exact invoice/reference number",
+    "invoice_date": "date in YYYY-MM-DD format", 
+    "due_date": "due date in YYYY-MM-DD format",
+    "vendor_name": "MANDATORY: company name sending the invoice",
+    "vendor_address": "complete vendor address",
+    "total_amount": "final total amount as number only",
+    "currency": "currency code (USD, INR, etc.)",
     "bank_details": {
-        "account_name": "bank account name if present",
-        "account_number": "account number if present", 
-        "routing_number": "routing/sort code if present",
-        "bank_name": "bank name if present",
-        "swift_code": "SWIFT/BIC code if present"
-    },
-    "line_items": [
-        {
-            "description": "item/service description",
-            "quantity": "quantity as number",
-            "unit_price": "price per unit as number",
-            "total": "line total as number",
-            "tax_rate": "tax percentage if shown",
-            "product_code": "SKU/product code if present"
-        }
-    ],
-    "additional_charges": [
-        {
-            "description": "charge description (shipping, handling, etc.)",
-            "amount": "charge amount as number"
-        }
-    ],
-    "discounts": [
-        {
-            "description": "discount description",
-            "amount": "discount amount as number"
-        }
-    ],
-    "notes": "any additional notes or special instructions",
-    "document_type": "type of document (invoice, credit note, etc.)"
+        "account_name": "bank account holder name",
+        "account_number": "bank account number", 
+        "routing_number": "routing number or sort code",
+        "bank_name": "bank name",
+        "ifsc_code": "IFSC code for Indian banks or equivalent"
+    }
 }
 
 CRITICAL EXTRACTION RULES:
-1. Extract EXACTLY what is written - preserve original spelling and case
-2. Use null for any fields that are not present or clearly visible
+1. VENDOR_NAME is MANDATORY - search thoroughly in letterhead, top section, "From" area
+2. Extract EXACTLY what is written - preserve original spelling and case  
 3. For amounts, extract as numbers without currency symbols (e.g., 1500.50 not "$1,500.50")
-4. For dates, convert to YYYY-MM-DD format, use null if format is unclear
-5. If multiple currencies appear, note the primary transaction currency
-6. Include ALL line items, charges, and discounts that are visible
-7. For addresses, include complete text including postal codes
-8. For tax IDs, include exactly as shown (with formatting)
-9. Return ONLY the JSON object, no explanations or additional text
-10. Ensure all amounts are mathematically consistent
+4. For dates, convert to YYYY-MM-DD format, use null if unclear
+5. Return ONLY the JSON object, no explanations or additional text
+6. If a field is not clearly visible, use null - do NOT guess or infer
 
-Double-check your extraction for accuracy before responding. Begin extraction:"""
+Extract only the essential payment data needed for processing. Begin extraction:"""
 
 
 class DataProcessor:
+    def cleanValue(self, value):
+        """Clean and validate values to ensure no null/empty data in Excel"""
+        if value is None or value == '' or value == 'null' or value == 'NULL' or value == 0:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned.lower() in ['null', 'none', 'n/a', 'na', '']:
+                return None
+            return cleaned
+        return value
+    
     def createDataFrame(self, extractedData):
         invoiceDate = extractedData.get('invoice_date')
         dueDate = extractedData.get('due_date') or extractedData.get('payment_terms', {}).get('due_date')
@@ -1417,26 +1390,48 @@ class DataProcessor:
                         extractedData.get('vendor_address') or 
                         None)
         
-        bulkPaymentData = {
-            'vendorName': vendorName,
-            'accountNumber': bankDetails.get('account_number') or None,
-            'routingNumber': bankDetails.get('routing_number') or None,
-            'paymentAmount': totalAmount,
-            'invoiceNumber': extractedData.get('invoice_number') or None,
-            'invoiceDate': invoiceDate if invoiceDate and invoiceDate.strip() and invoiceDate != 'null' else None,
-            'dueDate': dueDate if dueDate and dueDate.strip() and dueDate != 'null' else None,
-            'currency': currency,
-            'paymentReference': f"INV-{extractedData.get('invoice_number', 'UNKNOWN')}",
-            'bankName': bankDetails.get('bank_name') or None,
-            'swiftCode': bankDetails.get('swift_code') or None,
-            'vendorAddress': vendorAddress,
+        # Clean all values and only include populated fields
+        rawData = {
+            'vendorName': self.cleanValue(vendorName),
+            'accountNumber': self.cleanValue(bankDetails.get('account_number')),
+            'routingNumber': self.cleanValue(bankDetails.get('routing_number')),
+            'paymentAmount': totalAmount if totalAmount and totalAmount > 0 else None,
+            'invoiceNumber': self.cleanValue(extractedData.get('invoice_number')),
+            'invoiceDate': self.cleanValue(invoiceDate),
+            'dueDate': self.cleanValue(dueDate),
+            'currency': self.cleanValue(currency) or 'USD',
+            'paymentReference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
+            'bankName': self.cleanValue(bankDetails.get('bank_name')),
+            'ifscCode': self.cleanValue(bankDetails.get('ifsc_code')),
+            'vendorAddress': self.cleanValue(vendorAddress),
             'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
+        
+        # Ensure critical fields always exist, even if empty
+        bulkPaymentData = {}
+        for k, v in rawData.items():
+            if k in ['vendorName', 'paymentAmount', 'currency', 'processedDate']:
+                # Critical fields must always be present
+                bulkPaymentData[k] = v if v is not None else ('Unknown' if k == 'vendorName' else 'USD' if k == 'currency' else v)
+            elif v is not None:
+                # Optional fields only if they have values
+                bulkPaymentData[k] = v
         
         return pd.DataFrame([bulkPaymentData])
 
 
 class BulkDataProcessor:
+    def cleanValue(self, value):
+        """Clean and validate values to ensure no null/empty data in Excel"""
+        if value is None or value == '' or value == 'null' or value == 'NULL' or value == 0:
+            return None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if not cleaned or cleaned.lower() in ['null', 'none', 'n/a', 'na', '']:
+                return None
+            return cleaned
+        return value
+    
     def createBulkDataFrame(self, extractedDataList: List[Dict[str, Any]]) -> pd.DataFrame:
         """Create a DataFrame from multiple extracted invoice data"""
         bulkData = []
@@ -1480,26 +1475,36 @@ class BulkDataProcessor:
             invoiceDate = extractedData.get('invoice_date')
             dueDate = extractedData.get('due_date') or extractedData.get('payment_terms', {}).get('due_date') if isinstance(extractedData.get('payment_terms'), dict) else None
             
-            bulkPaymentData = {
-                'vendorName': vendorName,
-                'accountNumber': bankDetails.get('account_number') or None,
-                'routingNumber': bankDetails.get('routing_number') or bankDetails.get('swift_code') or None,
-                'paymentAmount': totalAmount,
-                'invoiceNumber': extractedData.get('invoice_number') or None,
-                'invoiceDate': invoiceDate if invoiceDate and invoiceDate.strip() and invoiceDate != 'null' else None,
-                'dueDate': dueDate if dueDate and str(dueDate).strip() and dueDate != 'null' else None,
-                'currency': currency,
-                'paymentReference': f"INV-{extractedData.get('invoice_number', 'UNKNOWN')}",
-                'bankName': bankDetails.get('bank_name') or None,
-                'swiftCode': bankDetails.get('swift_code') or None,
-                'vendorAddress': vendorAddress,
-                'sourceFile': extractedData.get('source_file', 'unknown'),
-                'fileSizeBytes': extractedData.get('file_size_bytes', 0),
+            # Clean all values and only include populated fields
+            rawData = {
+                'vendorName': self.cleanValue(vendorName),
+                'accountNumber': self.cleanValue(bankDetails.get('account_number')),
+                'routingNumber': self.cleanValue(bankDetails.get('routing_number') or bankDetails.get('ifsc_code')),
+                'paymentAmount': totalAmount if totalAmount and totalAmount > 0 else None,
+                'invoiceNumber': self.cleanValue(extractedData.get('invoice_number')),
+                'invoiceDate': self.cleanValue(invoiceDate),
+                'dueDate': self.cleanValue(dueDate),
+                'currency': self.cleanValue(currency) or 'USD',
+                'paymentReference': f"INV-{self.cleanValue(extractedData.get('invoice_number')) or 'UNKNOWN'}",
+                'bankName': self.cleanValue(bankDetails.get('bank_name')),
+                'ifscCode': self.cleanValue(bankDetails.get('ifsc_code')),
+                'vendorAddress': self.cleanValue(vendorAddress),
+                'sourceFile': self.cleanValue(extractedData.get('source_file')) or 'unknown',
                 'extractionConfidence': self.calculateExtractionConfidence(extractedData),
                 'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             
-            bulkData.append(bulkPaymentData)
+            # Ensure critical fields always exist
+            cleanedData = {}
+            for k, v in rawData.items():
+                if k in ['vendorName', 'paymentAmount', 'currency', 'processedDate']:
+                    # Critical fields must always be present
+                    cleanedData[k] = v if v is not None else ('Unknown' if k == 'vendorName' else 0.0 if k == 'paymentAmount' else 'USD' if k == 'currency' else v)
+                elif v is not None:
+                    # Optional fields only if they have values
+                    cleanedData[k] = v
+            
+            bulkData.append(cleanedData)
         
         logger.info(f"Created bulk DataFrame with {len(bulkData)} records")
         return pd.DataFrame(bulkData)
@@ -1643,7 +1648,7 @@ class DatabaseProcessor:
                 currency VARCHAR(10),
                 payment_reference VARCHAR(100),
                 bank_name VARCHAR(255),
-                swift_code VARCHAR(20),
+                ifsc_code VARCHAR(20),
                 vendor_address TEXT,
                 processed_date TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1656,7 +1661,7 @@ class DatabaseProcessor:
                 INSERT INTO bulk_payments (
                     vendor_name, account_number, routing_number, payment_amount,
                     invoice_number, invoice_date, due_date, currency,
-                    payment_reference, bank_name, swift_code, vendor_address, processed_date
+                    payment_reference, bank_name, ifsc_code, vendor_address, processed_date
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
                 cursor.execute(insertQuery, (
@@ -1696,7 +1701,7 @@ class DatabaseProcessor:
                 currency VARCHAR(10),
                 payment_reference VARCHAR(100),
                 bank_name VARCHAR(255),
-                swift_code VARCHAR(20),
+                ifsc_code VARCHAR(20),
                 vendor_address TEXT,
                 processed_date TIMESTAMP,
                 batch_id VARCHAR(100),
@@ -1716,7 +1721,7 @@ class DatabaseProcessor:
                     INSERT INTO bulk_payments (
                         vendor_name, account_number, routing_number, payment_amount,
                         invoice_number, invoice_date, due_date, currency,
-                        payment_reference, bank_name, swift_code, vendor_address, 
+                        payment_reference, bank_name, ifsc_code, vendor_address, 
                         processed_date, batch_id, confidence_score, extraction_method
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
