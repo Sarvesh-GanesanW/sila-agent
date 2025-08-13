@@ -26,10 +26,22 @@ class InvoiceProcessor:
         try:
             logger.info(f"Starting invoice extraction - Request ID: {context.aws_request_id}")
             
-            s3Bucket = event.get('s3_bucket')
-            s3Key = event.get('s3_key')
-            pdfData = event.get('pdf_data')
-            customPrompt = event.get('prompt')
+            # Handle HTTP requests from Function URL
+            if 'body' in event:
+                # This is an HTTP request, parse the body
+                body = event['body']
+                if isinstance(body, str):
+                    event_data = json.loads(body)
+                else:
+                    event_data = body
+            else:
+                # Direct Lambda invocation
+                event_data = event
+            
+            s3Bucket = event_data.get('s3_bucket')
+            s3Key = event_data.get('s3_key')
+            pdfData = event_data.get('pdf_data')
+            customPrompt = event_data.get('prompt')
             
             if not s3Bucket and not pdfData:
                 return {
@@ -1124,21 +1136,42 @@ Double-check your extraction for accuracy before responding. Begin extraction:""
 class DataProcessor:
     def createDataFrame(self, extractedData):
         invoiceDate = extractedData.get('invoice_date')
-        dueDate = extractedData.get('due_date')
+        dueDate = extractedData.get('due_date') or extractedData.get('payment_terms', {}).get('due_date')
+        
+        vendorInfo = extractedData.get('vendor', {})
+        bankDetails = extractedData.get('bank_details', {})
+        totals = extractedData.get('totals', {})
+        additionalInfo = extractedData.get('additional_info', {})
+        
+        vendorName = (vendorInfo.get('name') or 
+                     extractedData.get('vendor_name') or 
+                     None)
+        
+        totalAmount = (totals.get('total_amount') or 
+                      extractedData.get('total_amount') or 
+                      0)
+        
+        currency = (additionalInfo.get('currency') or 
+                   extractedData.get('currency') or 
+                   'USD')
+        
+        vendorAddress = (vendorInfo.get('address') or 
+                        extractedData.get('vendor_address') or 
+                        None)
         
         bulkPaymentData = {
-            'vendorName': extractedData.get('vendor_name') or None,
-            'accountNumber': extractedData.get('bank_details', {}).get('account_number') or None,
-            'routingNumber': extractedData.get('bank_details', {}).get('routing_number') or None,
-            'paymentAmount': extractedData.get('total_amount') or 0,
+            'vendorName': vendorName,
+            'accountNumber': bankDetails.get('account_number') or None,
+            'routingNumber': bankDetails.get('routing_number') or None,
+            'paymentAmount': totalAmount,
             'invoiceNumber': extractedData.get('invoice_number') or None,
             'invoiceDate': invoiceDate if invoiceDate and invoiceDate.strip() and invoiceDate != 'null' else None,
             'dueDate': dueDate if dueDate and dueDate.strip() and dueDate != 'null' else None,
-            'currency': extractedData.get('currency', 'USD'),
+            'currency': currency,
             'paymentReference': f"INV-{extractedData.get('invoice_number', 'UNKNOWN')}",
-            'bankName': extractedData.get('bank_details', {}).get('bank_name') or None,
-            'swiftCode': extractedData.get('bank_details', {}).get('swift_code') or None,
-            'vendorAddress': extractedData.get('vendor_address') or None,
+            'bankName': bankDetails.get('bank_name') or None,
+            'swiftCode': bankDetails.get('swift_code') or None,
+            'vendorAddress': vendorAddress,
             'processedDate': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         

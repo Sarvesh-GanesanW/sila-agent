@@ -1,4 +1,4 @@
-Dpandas
+pandas
 boto3
 psycopg2-binary
 openpyxl
