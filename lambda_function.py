@@ -14,6 +14,8 @@ from PIL import Image
 import tempfile
 import concurrent.futures
 from typing import List, Dict, Any
+import time
+import random
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -45,7 +47,7 @@ class InvoiceProcessor:
             s3Folder = event_data.get('s3_folder')  # For bulk processing
             pdfData = event_data.get('pdf_data')  # For direct upload
             customPrompt = event_data.get('prompt')
-            maxConcurrency = event_data.get('max_concurrency', 5)  # Limit concurrent processing
+            maxConcurrency = event_data.get('max_concurrency', 2)  # Reduced default to prevent throttling
             
             # Validate input parameters
             if not s3Bucket and not pdfData:
@@ -927,8 +929,20 @@ Look more carefully for:
         except ValueError:
             return None
 
-    def processWithBedrock(self, pdfData, customPrompt=None):
+    def processWithBedrock(self, pdfData, customPrompt=None, retryCount=0):
+        maxRetries = 3
+        baseDelay = 2.0
+        
         try:
+            # Rate limiting: Add delay between calls
+            if retryCount > 0:
+                delay = baseDelay * (2 ** retryCount) + random.uniform(0.5, 1.5)
+                logger.info(f"Rate limiting: waiting {delay:.2f} seconds before retry {retryCount}")
+                time.sleep(delay)
+            else:
+                # Always add small delay to prevent rapid-fire requests
+                time.sleep(random.uniform(0.5, 1.0))
+            
             prompt = customPrompt if customPrompt else self.getComprehensiveExtractionPrompt()
             
             logger.info(f"Using prompt length: {len(prompt)} characters")
@@ -984,12 +998,15 @@ Look more carefully for:
             
         except ClientError as e:
             errorCode = e.response['Error']['Code']
-            if errorCode == 'ValidationException':
+            if errorCode == 'ThrottlingException' and retryCount < maxRetries:
+                logger.warning(f"Throttling exception, retrying {retryCount + 1}/{maxRetries}")
+                return self.processWithBedrock(pdfData, customPrompt, retryCount + 1)
+            elif errorCode == 'ValidationException':
                 logger.error("Bedrock validation error - likely invalid base64 data")
             elif errorCode == 'AccessDeniedException':
                 logger.error("Bedrock access denied - check IAM permissions")
             elif errorCode == 'ThrottlingException':
-                logger.error("Bedrock throttling - too many requests")
+                logger.error(f"Bedrock throttling - max retries ({maxRetries}) exceeded")
             else:
                 logger.error(f"Bedrock error {errorCode}: {e}")
             raise Exception(f"Bedrock processing failed: {str(e)}")
@@ -1321,15 +1338,25 @@ Look more carefully for:
     def getComprehensiveExtractionPrompt(self):
         return """You are an expert invoice data extraction system. Extract ONLY the essential payment information from this invoice.
 
-MANDATORY: Find the vendor/supplier name - look at the top of the invoice, letterhead, or "From" section.
+🔥 CRITICAL: VENDOR_NAME IS MANDATORY - YOU MUST FIND IT! 🔥
 
-Return ONLY this simplified JSON structure with populated values:
+Look EVERYWHERE for the vendor/company name:
+- Top letterhead area
+- Header sections  
+- "From:" or "Bill From:" sections
+- Company logos with text
+- Sender information
+- Any business name on the document
+
+THE VENDOR_NAME FIELD CANNOT BE NULL OR EMPTY!
+
+Return this JSON structure:
 
 {
     "invoice_number": "exact invoice/reference number",
     "invoice_date": "date in YYYY-MM-DD format", 
     "due_date": "due date in YYYY-MM-DD format",
-    "vendor_name": "MANDATORY: company name sending the invoice",
+    "vendor_name": "MANDATORY FIELD: The company/business name issuing this invoice - CANNOT BE NULL",
     "vendor_address": "complete vendor address",
     "total_amount": "final total amount as number only",
     "currency": "currency code (USD, INR, etc.)",
@@ -1369,26 +1396,12 @@ class DataProcessor:
         invoiceDate = extractedData.get('invoice_date')
         dueDate = extractedData.get('due_date') or extractedData.get('payment_terms', {}).get('due_date')
         
-        vendorInfo = extractedData.get('vendor', {})
+        # Direct extraction from simplified JSON structure
+        vendorName = extractedData.get('vendor_name')
         bankDetails = extractedData.get('bank_details', {})
-        totals = extractedData.get('totals', {})
-        additionalInfo = extractedData.get('additional_info', {})
-        
-        vendorName = (vendorInfo.get('name') or 
-                     extractedData.get('vendor_name') or 
-                     None)
-        
-        totalAmount = (totals.get('total_amount') or 
-                      extractedData.get('total_amount') or 
-                      0)
-        
-        currency = (additionalInfo.get('currency') or 
-                   extractedData.get('currency') or 
-                   'USD')
-        
-        vendorAddress = (vendorInfo.get('address') or 
-                        extractedData.get('vendor_address') or 
-                        None)
+        totalAmount = extractedData.get('total_amount', 0)
+        currency = extractedData.get('currency', 'USD')
+        vendorAddress = extractedData.get('vendor_address')
         
         # Clean all values and only include populated fields
         rawData = {
@@ -1412,7 +1425,12 @@ class DataProcessor:
         for k, v in rawData.items():
             if k in ['vendor_name', 'payment_amount', 'currency', 'processed_date']:
                 # Critical fields must always be present
-                bulkPaymentData[k] = v if v is not None else ('Unknown' if k == 'vendor_name' else 'USD' if k == 'currency' else v)
+                if k == 'vendor_name' and v is None:
+                    # Try to extract vendor name from other fields as fallback
+                    fallbackVendor = bankDetails.get('account_name') or 'VENDOR_NOT_FOUND'
+                    bulkPaymentData[k] = fallbackVendor
+                else:
+                    bulkPaymentData[k] = v if v is not None else ('USD' if k == 'currency' else v)
             elif v is not None:
                 # Optional fields only if they have values
                 bulkPaymentData[k] = v
@@ -1437,39 +1455,12 @@ class BulkDataProcessor:
         bulkData = []
         
         for extractedData in extractedDataList:
-            vendorInfo = extractedData.get('vendor', {}) if isinstance(extractedData.get('vendor'), dict) else {}
+            # Direct extraction from simplified JSON structure
+            vendorName = extractedData.get('vendor_name')
             bankDetails = extractedData.get('bank_details', {}) if isinstance(extractedData.get('bank_details'), dict) else {}
-            totals = extractedData.get('totals', {}) if isinstance(extractedData.get('totals'), dict) else {}
-            additionalInfo = extractedData.get('additional_info', {}) if isinstance(extractedData.get('additional_info'), dict) else {}
-            
-            # Extract vendor name from multiple possible locations
-            vendorName = (
-                vendorInfo.get('name') or 
-                extractedData.get('vendor_name') or 
-                extractedData.get('vendor', {}).get('name') if isinstance(extractedData.get('vendor'), dict) else extractedData.get('vendor') or
-                None
-            )
-            
-            # Extract total amount from multiple possible locations  
-            totalAmount = (
-                totals.get('total_amount') or 
-                extractedData.get('total_amount') or 
-                0
-            )
-            
-            # Extract currency
-            currency = (
-                additionalInfo.get('currency') or 
-                extractedData.get('currency') or 
-                'USD'
-            )
-            
-            # Extract vendor address
-            vendorAddress = (
-                vendorInfo.get('address') or 
-                extractedData.get('vendor_address') or 
-                None
-            )
+            totalAmount = extractedData.get('total_amount', 0)
+            currency = extractedData.get('currency', 'USD')
+            vendorAddress = extractedData.get('vendor_address')
             
             # Extract dates
             invoiceDate = extractedData.get('invoice_date')
@@ -1499,7 +1490,12 @@ class BulkDataProcessor:
             for k, v in rawData.items():
                 if k in ['vendor_name', 'payment_amount', 'currency', 'processed_date']:
                     # Critical fields must always be present
-                    cleanedData[k] = v if v is not None else ('Unknown' if k == 'vendor_name' else 0.0 if k == 'payment_amount' else 'USD' if k == 'currency' else v)
+                    if k == 'vendor_name' and v is None:
+                        # Try to extract vendor name from other fields as fallback
+                        fallbackVendor = bankDetails.get('account_name') or 'VENDOR_NOT_FOUND'
+                        cleanedData[k] = fallbackVendor
+                    else:
+                        cleanedData[k] = v if v is not None else (0.0 if k == 'payment_amount' else 'USD' if k == 'currency' else v)
                 elif v is not None:
                     # Optional fields only if they have values
                     cleanedData[k] = v
